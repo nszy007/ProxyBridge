@@ -19,26 +19,24 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '9.0.x'
-        # 添加ARM64架构支持
         architecture: arm64
 
     - name: Setup MSYS2 (for ARM64 GCC)
       uses: msys2/setup-msys2@v2
       with:
-        msystem: MINGW64  # ARM64工具链仍使用MINGW64环境
+        msystem: CLANGARM64  # 切换到ARM64专属环境
         update: true
         install: >-
-          mingw-w64-arm64-gcc  # 安装ARM64版本GCC
-          mingw-w64-arm64-toolchain  # ARM64工具链
+          mingw-w64-clang-aarch64-gcc-compat  # 正确的ARM64 GCC包名
+          mingw-w64-clang-aarch64-toolchain   # 正确的ARM64工具链包名
 
     - name: Add MSYS2 ARM64 tools to PATH
-      run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      run: echo "C:\msys64\clangarm64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       shell: pwsh
 
     - name: Install NSIS (with ARM64 support)
       run: |
         choco install nsis -y
-        # 安装NSIS ARM64插件
         choco install nsis-nsisarm -y
       shell: pwsh
 
@@ -47,7 +45,6 @@ jobs:
         $url = "https://github.com/basil00/Divert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
         Invoke-WebRequest -Uri $url -OutFile "WinDivert.zip"
         Expand-Archive -Path "WinDivert.zip" -DestinationPath "C:\"
-        # 验证ARM64版本文件存在
         if (-not (Test-Path "C:\WinDivert-2.2.2-A\arm64")) {
           Write-Error "WinDivert ARM64 binaries not found"
           exit 1
@@ -56,7 +53,6 @@ jobs:
 
     - name: Build project (ARM64)
       run: |
-        # 设置ARM64编译参数
         $env:TARGET_ARCH = "arm64"
         $env:WIN_DIVERT_PATH = "C:\WinDivert-2.2.2-A\arm64"
         .\compile.ps1 -NoSign -Compiler aarch64-w64-mingw32-gcc -Architecture arm64

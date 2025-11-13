@@ -4,10 +4,32 @@ param(
     [string]$Compiler = 'auto',
 
     [Parameter(Mandatory=$false)]
-    [switch]$NoSign
+    [switch]$NoSign,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet('x64', 'x86', 'arm64')]
+    [string]$Arch
 )
 
-$WinDivertPath = "C:\WinDivert-2.2.2-A"
+# Auto-detect architecture if not specified
+if (-not $PSBoundParameters.ContainsKey('Arch')) {
+    $nativeArch = $env:PROCESSOR_ARCHITECTURE
+    Write-Host "Auto-detecting architecture: $nativeArch" -ForegroundColor Cyan
+    if ($nativeArch -eq 'AMD64') {
+        $Arch = 'x64'
+    } elseif ($nativeArch -eq 'ARM64') {
+        $Arch = 'arm64'
+    } elseif ($nativeArch -eq 'X86') {
+        $Arch = 'x86'
+    } else {
+        Write-Host "Unsupported architecture for auto-detection: $nativeArch. Defaulting to x64." -ForegroundColor Yellow
+        $Arch = 'x64'
+    }
+}
+Write-Host "Building for Architecture: $Arch" -ForegroundColor Cyan
+
+# Dynamically find WinDivert path
+$WinDivertPath = (Get-ChildItem "C:\WinDivert-*-A" | Select-Object -First 1).FullName
 $SourcePath = "src"
 $SourceFile = "ProxyBridge.c"
 $OutputDLL = "ProxyBridgeCore.dll"
@@ -17,9 +39,6 @@ $SignTool = "signtool.exe"
 $CertThumbprint = ""
 $TimestampServer = "http://timestamp.digicert.com"
 
-$Arch = if ([Environment]::Is64BitProcess) { "x64" } else { "x86" }
-Write-Host "Architecture: $Arch" -ForegroundColor Cyan
-
 if (Test-Path $OutputDir) {
     Write-Host "Removing existing output directory..." -ForegroundColor Yellow
     Remove-Item $OutputDir -Recurse -Force
@@ -28,12 +47,19 @@ Write-Host "Creating output directory: $OutputDir" -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 if (-not (Test-Path $WinDivertPath)) {
-    Write-Host "ERROR: WinDivert not found at: $WinDivertPath" -ForegroundColor Red
-    Write-Host "Please update the path in this script or install WinDivert" -ForegroundColor Yellow
+    Write-Host "ERROR: WinDivert not found at: C:\WinDivert-*-A" -ForegroundColor Red
+    Write-Host "Please ensure WinDivert was built or downloaded correctly." -ForegroundColor Yellow
     exit 1
 }
 
 function Compile-MSVC {
+    # MSVC compilation is not configured for ARM64 in this script.
+    # We will rely on Clang/GCC for ARM64.
+    if ($Arch -eq 'arm64') {
+        Write-Host "MSVC compilation for ARM64 is not supported by this script. Please use -Compiler gcc." -ForegroundColor Yellow
+        return $false
+    }
+
     Write-Host "`nCompiling DLL with MSVC..." -ForegroundColor Green
 
     $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -66,21 +92,27 @@ function Compile-MSVC {
     return $exitCode -eq 0
 }
 
-function Compile-GCC {
-    Write-Host "`nCompiling DLL with GCC..." -ForegroundColor Green
+function Compile-Mingw { # Changed from Compile-GCC
+    Write-Host "`nCompiling DLL with MinGW/Clang..." -ForegroundColor Green
 
-    $gccVersion = cmd /c gcc --version 2>&1
+    $compilerExe = if ($Arch -eq 'arm64') { 'clang' } else { 'gcc' }
+    $compilerVersion = cmd /c "$compilerExe --version 2>&1"
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "GCC not found in PATH" -ForegroundColor Yellow
+        Write-Host "ERROR: $compilerExe not found in PATH" -ForegroundColor Red
         return $false
     }
+    Write-Host "$compilerExe found: $($compilerVersion[0])" -ForegroundColor Cyan
 
-    Write-Host "GCC found: $($gccVersion[0])" -ForegroundColor Cyan
+    $libArchDir = switch ($Arch) {
+        'x64'   { 'x64' }
+        'x86'   { 'x86' }
+        'arm64' { 'aarch64' } # clang-aarch64 toolchain uses 'aarch64'
+    }
 
-    $cmd = "gcc -shared -O2 -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
+    $cmd = "$compilerExe -shared -O2 -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
            "-I`"$WinDivertPath\include`" " +
            "$SourcePath\$SourceFile " +
-           "-L`"$WinDivertPath\$Arch`" " +
+           "-L`"$WinDivertPath\$libArchDir`" " +
            "-lWinDivert -lws2_32 -liphlpapi " +
            "-o $OutputDLL"
 
@@ -131,24 +163,23 @@ function Sign-Binary {
     }
 }
 
-
-
-
 $success = $false
+# On arm64, force compiler to 'gcc' (which now means clang)
+if ($Arch -eq 'arm64') {
+    $Compiler = 'gcc'
+}
 
 if ($Compiler -eq 'auto') {
     Write-Host "Auto-detecting compiler..." -ForegroundColor Cyan
-
     $success = Compile-MSVC
-
     if (-not $success) {
         Write-Host "`nMSVC compilation failed, trying GCC..." -ForegroundColor Yellow
-        $success = Compile-GCC
+        $success = Compile-Mingw
     }
 } elseif ($Compiler -eq 'msvc') {
     $success = Compile-MSVC
 } elseif ($Compiler -eq 'gcc') {
-    $success = Compile-GCC
+    $success = Compile-Mingw
 }
 
 
@@ -159,26 +190,47 @@ if ($success) {
     Move-Item $OutputDLL -Destination $OutputDir -Force
     Write-Host "  Moved: $OutputDLL -> $OutputDir\" -ForegroundColor Gray
 
-    $files = @(
-        "$WinDivertPath\$Arch\WinDivert.dll",
-        "$WinDivertPath\$Arch\WinDivert64.sys",
-        "$WinDivertPath\$Arch\WinDivert32.sys"
-    )
-    foreach ($file in $files) {
+    $libArchDir = switch ($Arch) {
+        'x64'   { 'x64' }
+        'x86'   { 'x86' }
+        'arm64' { 'aarch64' }
+    }
+    $divertLibPath = Join-Path $WinDivertPath $libArchDir
+    
+    $filesToCopy = @()
+    $filesToCopy += Join-Path $divertLibPath "WinDivert.dll"
+
+    if ($Arch -eq 'x64') {
+        $filesToCopy += Join-Path $divertLibPath "WinDivert64.sys"
+        $filesToCopy += Join-Path $divertLibPath "WinDivert32.sys"
+    } elseif ($Arch -eq 'arm64' -or $Arch -eq 'x86') {
+        $filesToCopy += Join-Path $divertLibPath "WinDivert.sys"
+    }
+
+    foreach ($file in $filesToCopy) {
         if (Test-Path $file) {
             Copy-Item $file -Destination $OutputDir -Force
             Write-Host "  Copied: $(Split-Path $file -Leaf)" -ForegroundColor Gray
+        } else {
+            Write-Host "  Warning: Could not find file to copy: $file" -ForegroundColor Yellow
         }
     }
+    
+    $dotnetRid = switch ($Arch) {
+        'x64'   { 'win-x64' }
+        'x86'   { 'win-x86' }
+        'arm64' { 'win-arm64' }
+        default { 'win-x64' }
+    }
+    Write-Host "`nUsing .NET Runtime Identifier (RID): $dotnetRid" -ForegroundColor Cyan
 
     Write-Host "`nPublishing GUI..." -ForegroundColor Green
-    $publishResult = dotnet publish gui/ProxyBridge.GUI.csproj -c Release -r win-x64 --self-contained -o gui/bin/Release/net9.0-windows/win-x64/publish 2>&1
+    $guiPublishPath = "gui/bin/Release/net9.0-windows/$dotnetRid/publish"
+    $publishResult = dotnet publish gui/ProxyBridge.GUI.csproj -c Release -r $dotnetRid --self-contained -o $guiPublishPath 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  GUI published successfully" -ForegroundColor Gray
 
         Write-Host "`nCopying GUI files to output..." -ForegroundColor Green
-        $guiPublishPath = "gui\bin\Release\net9.0-windows\win-x64\publish"
-
         Copy-Item "$guiPublishPath\ProxyBridge.exe" -Destination $OutputDir -Force
         Write-Host "  Copied: ProxyBridge.exe" -ForegroundColor Gray
 
@@ -192,13 +244,12 @@ if ($success) {
     }
 
     Write-Host "`nPublishing CLI..." -ForegroundColor Green
-    $publishResult = dotnet publish cli/ProxyBridge.CLI.csproj -c Release -r win-x64 --self-contained -o cli/bin/Release/net9.0-windows/win-x64/publish 2>&1
+    $cliPublishPath = "cli/bin/Release/net9.0-windows/$dotnetRid/publish"
+    $publishResult = dotnet publish cli/ProxyBridge.CLI.csproj -c Release -r $dotnetRid --self-contained -o $cliPublishPath 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  CLI published successfully" -ForegroundColor Gray
 
         Write-Host "`nCopying CLI files to output..." -ForegroundColor Green
-        $cliPublishPath = "cli\bin\Release\net9.0-windows\win-x64\publish"
-
         Copy-Item "$cliPublishPath\ProxyBridge_CLI.exe" -Destination $OutputDir -Force
         Write-Host "  Copied: ProxyBridge_CLI.exe" -ForegroundColor Gray
     } else {
@@ -241,24 +292,27 @@ if ($success) {
     $nsisPath = "C:\Program Files (x86)\NSIS\Bin\makensis.exe"
     if (Test-Path $nsisPath) {
         Push-Location installer
-        $result = & $nsisPath "ProxyBridge.nsi" 2>&1
+        # Pass architecture to NSIS script
+        $result = & $nsisPath "/DARCH=$Arch" "ProxyBridge.nsi" 2>&1
         Pop-Location
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Installer created successfully" -ForegroundColor Green
-            $installerName = "ProxyBridge-Setup-2.0.1.exe"
+            # Installer name might need to be arch-specific
+            $installerName = "ProxyBridge-Setup-2.0.1.exe" 
             if (Test-Path "installer\$installerName") {
-                Move-Item "installer\$installerName" -Destination $OutputDir -Force
-                Write-Host "  Moved: $installerName -> $OutputDir\" -ForegroundColor Gray
+                $archSpecificInstallerName = "ProxyBridge-Setup-2.0.1-$Arch.exe"
+                Move-Item "installer\$installerName" -Destination "$OutputDir\$archSpecificInstallerName" -Force
+                Write-Host "  Moved and Renamed: $archSpecificInstallerName -> $OutputDir\" -ForegroundColor Gray
 
                 if (-not $NoSign) {
                     Write-Host "`nSigning installer..." -ForegroundColor Green
-                    if (Sign-Binary -FilePath "$OutputDir\$installerName") {
-                        $installerSize = [math]::Round((Get-Item "$OutputDir\$installerName").Length/1MB, 2)
-                        Write-Host "  Installer ready: $OutputDir\$installerName ($installerSize MB)" -ForegroundColor Cyan
+                    if (Sign-Binary -FilePath "$OutputDir\$archSpecificInstallerName") {
+                        $installerSize = [math]::Round((Get-Item "$OutputDir\$archSpecificInstallerName").Length/1MB, 2)
+                        Write-Host "  Installer ready: $OutputDir\$archSpecificInstallerName ($installerSize MB)" -ForegroundColor Cyan
                     }
                 } else {
-                    $installerSize = [math]::Round((Get-Item "$OutputDir\$installerName").Length/1MB, 2)
-                    Write-Host "  Installer ready: $OutputDir\$installerName ($installerSize MB)" -ForegroundColor Cyan
+                    $installerSize = [math]::Round((Get-Item "$OutputDir\$archSpecificInstallerName").Length/1MB, 2)
+                    Write-Host "  Installer ready: $OutputDir\$archSpecificInstallerName ($installerSize MB)" -ForegroundColor Cyan
                 }
             }
         } else {

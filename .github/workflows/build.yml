@@ -1,4 +1,4 @@
-name: Build ProxyBridge
+name: Build ProxyBridge (ARM64)
 
 on:
   push:
@@ -19,57 +19,59 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '9.0.x'
+        # 添加ARM64架构支持
+        architecture: arm64
 
-    - name: Setup MSYS2 (for GCC)
+    - name: Setup MSYS2 (for ARM64 GCC)
       uses: msys2/setup-msys2@v2
       with:
-        msystem: MINGW64
+        msystem: MINGW64  # ARM64工具链仍使用MINGW64环境
         update: true
         install: >-
-          mingw-w64-x86_64-gcc
-          mingw-w64-x86_64-toolchain
+          mingw-w64-arm64-gcc  # 安装ARM64版本GCC
+          mingw-w64-arm64-toolchain  # ARM64工具链
 
-    - name: Add MSYS2 to PATH
+    - name: Add MSYS2 ARM64 tools to PATH
       run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       shell: pwsh
 
-    - name: Install NSIS
+    - name: Install NSIS (with ARM64 support)
       run: |
         choco install nsis -y
+        # 安装NSIS ARM64插件
+        choco install nsis-nsisarm -y
       shell: pwsh
 
-    - name: Download WinDivert
+    - name: Download WinDivert (ARM64)
       run: |
         $url = "https://github.com/basil00/Divert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
         Invoke-WebRequest -Uri $url -OutFile "WinDivert.zip"
         Expand-Archive -Path "WinDivert.zip" -DestinationPath "C:\"
-      shell: pwsh
-
-    - name: Verify WinDivert installation
-      run: |
-        if (Test-Path "C:\WinDivert-2.2.2-A") {
-          Write-Host "WinDivert installed successfully"
-          Get-ChildItem "C:\WinDivert-2.2.2-A" -Recurse | Select-Object FullName
-        } else {
-          Write-Error "WinDivert installation failed"
+        # 验证ARM64版本文件存在
+        if (-not (Test-Path "C:\WinDivert-2.2.2-A\arm64")) {
+          Write-Error "WinDivert ARM64 binaries not found"
           exit 1
         }
       shell: pwsh
 
-    - name: Build project
-      run: .\compile.ps1 -NoSign -Compiler gcc
+    - name: Build project (ARM64)
+      run: |
+        # 设置ARM64编译参数
+        $env:TARGET_ARCH = "arm64"
+        $env:WIN_DIVERT_PATH = "C:\WinDivert-2.2.2-A\arm64"
+        .\compile.ps1 -NoSign -Compiler aarch64-w64-mingw32-gcc -Architecture arm64
       shell: pwsh
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ProxyBridge-Build-${{ github.sha }}
+        name: ProxyBridge-ARM64-Build-${{ github.sha }}
         path: output/
         retention-days: 30
 
     - name: List output files
       run: |
-        Write-Host "`nBuild artifacts:"
+        Write-Host "`nARM64 Build artifacts:"
         Get-ChildItem output -Recurse | ForEach-Object {
           $size = [math]::Round($_.Length/1MB, 2)
           Write-Host "  $($_.Name) - $size MB"
